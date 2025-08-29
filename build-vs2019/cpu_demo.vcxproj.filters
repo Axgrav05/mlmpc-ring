@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Applications\VSCode\CPUEmu\mlmpmc-ring\demos\cpu_demo.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Applications\VSCode\CPUEmu\mlmpmc-ring\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{0EEB0641-18D2-383C-8F09-936ACF7FDD66}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
