@@ -1,21 +1,26 @@
 #pragma once
-#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <span>
+#include <new>
 #include <thread>
 #include <type_traits>
 #include <utility>
-#include <new>
+#include <algorithm>
+#include <chrono>
 #include "ring.hpp"
 #include "utils.hpp"
+
+#if defined(_MSC_VER)
+  #include <immintrin.h>
+  #define RING_PAUSE() _mm_pause()
+#else
+  #define RING_PAUSE() do {} while(0)
+#endif
 
 namespace ring {
 
 // Multi-Producer / Multi-Consumer ring with ticketed slots.
-// Head/tail indices are global atomics; threads reserve indexes via fetch_add.
-// Each slot's ticket encodes lifecycle to avoid ABA.
 template <class T>
 class RingMPMC {
 public:
@@ -40,28 +45,22 @@ public:
 
     std::size_t capacity() const noexcept { return capacity_; }
 
+    // -------- Single-item ops --------
     bool try_enqueue(const T& v) noexcept {
         std::uint64_t pos = tail_.load(RELAXED);
         for (;;) {
             Slot<T>& s = slot(pos);
             std::uint64_t seq = s.seq.load(ACQUIRE);
-            // Producer expects seq == pos
             intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
             if (diff == 0) {
-                // Attempt to claim this index
                 if (tail_.compare_exchange_weak(pos, pos + 1, ACQ_REL, RELAXED)) {
-                    // We own slot 'pos'
-                    new (s.ptr()) T(v);
-                    s.seq.store(pos + 1, RELEASE); // publish
+                    construct_in_slot(s, v);
+                    s.seq.store(pos + 1, RELEASE);
                     return true;
                 }
-                // CAS failed: 'pos' updated; retry with new 'pos'
-                continue;
             } else if (diff < 0) {
-                // seq < pos  => queue appears full (consumer hasn't advanced this slot yet)
-                return false;
+                return false; // full
             } else {
-                // Another producer already advanced this slot; reload tail and retry
                 pos = tail_.load(RELAXED);
             }
         }
@@ -75,11 +74,10 @@ public:
             intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
             if (diff == 0) {
                 if (tail_.compare_exchange_weak(pos, pos + 1, ACQ_REL, RELAXED)) {
-                    new (s.ptr()) T(std::move(v));
+                    construct_in_slot(s, std::move(v));
                     s.seq.store(pos + 1, RELEASE);
                     return true;
                 }
-                continue;
             } else if (diff < 0) {
                 return false;
             } else {
@@ -93,94 +91,48 @@ public:
         for (;;) {
             Slot<T>& s = slot(pos);
             std::uint64_t seq = s.seq.load(ACQUIRE);
-            // Consumer expects seq == pos + 1
             intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
             if (diff == 0) {
                 if (head_.compare_exchange_weak(pos, pos + 1, ACQ_REL, RELAXED)) {
-                    T* p = s.ptr();
-                    out = std::move(*p);
-                    p->~T();
-                    // Make slot available for next wrap
+                    move_out_and_destroy(s, out);
                     s.seq.store(pos + capacity_, RELEASE);
                     return true;
                 }
-                continue;
             } else if (diff < 0) {
-                // seq < pos+1 => queue appears empty
-                return false;
+                return false; // empty
             } else {
-                // Another consumer already advanced; reload head and retry
                 pos = head_.load(RELAXED);
             }
         }
     }
 
-
-    // Reserve up to items.size() slots with ONE fetch_add on tail.
-// Then publish sequentially. This may spin briefly if a slot hasn't been freed yet.
-    std::size_t enqueue_many(std::span<const T> items) noexcept {
-        const std::size_t n = items.size();
-        if (n == 0) return 0;
-        // Clamp batch size to capacity to avoid pathological large spans
-        const std::size_t want = (n > capacity_) ? capacity_ : n;
-
-        std::uint64_t start = tail_.fetch_add(want, ACQ_REL);
-        std::size_t done = 0;
-        for (std::size_t i = 0; i < want; ++i) {
-            const std::uint64_t idx = start + i;
-            Slot<T>& s = slot(idx);
-            // Wait (briefly) for this slot to become available (seq == idx)
-            std::uint64_t expected = idx;
-            // short spin; fall back to yield to be polite
-            int spins = 0;
-            for (;;) {
-                std::uint64_t seq = s.seq.load(ACQUIRE);
-                if (seq == expected) break;
-                if (++spins < 200) { /* optional: _mm_pause(); */ }
-                else { std::this_thread::yield(); spins = 0; }
-            }
-            new (s.ptr()) T(items[i]);
-            s.seq.store(idx + 1, RELEASE);
-            ++done;
-        }
-        return done;
+    // -------- Deadline wrappers (spin/yield until deadline) --------
+    template <class Clock, class Dur>
+    bool enqueue_until(const T& v, const std::chrono::time_point<Clock, Dur>& deadline) noexcept {
+        int spins = 0;
+        do {
+            if (try_enqueue(v)) return true;
+            if (++spins < 200) { RING_PAUSE(); }
+            else { std::this_thread::yield(); spins = 0; }
+        } while (Clock::now() < deadline);
+        return false;
     }
 
-    // Reserve up to out.size() items from head with ONE fetch_add.
-    // Spins briefly if an element isn't ready yet.
-    std::size_t dequeue_many(std::span<T> out) noexcept {
-        const std::size_t n = out.size();
-        if (n == 0) return 0;
-        const std::size_t want = (n > capacity_) ? capacity_ : n;
-
-        std::uint64_t start = head_.fetch_add(want, ACQ_REL);
-        std::size_t done = 0;
-        for (std::size_t i = 0; i < want; ++i) {
-            const std::uint64_t idx = start + i;
-            Slot<T>& s = slot(idx);
-            const std::uint64_t expected = idx + 1;
-            int spins = 0;
-            for (;;) {
-                std::uint64_t seq = s.seq.load(ACQUIRE);
-                if (seq == expected) break;
-                if (++spins < 200) { /* optional: _mm_pause(); */ }
-                else { std::this_thread::yield(); spins = 0; }
-            }
-            T* p = s.ptr();
-            out[i] = std::move(*p);
-            p->~T();
-            s.seq.store(idx + capacity_, RELEASE);
-            ++done;
-        }
-        return done;
+    template <class Clock, class Dur>
+    bool dequeue_until(T& out, const std::chrono::time_point<Clock, Dur>& deadline) noexcept {
+        int spins = 0;
+        do {
+            if (try_dequeue(out)) return true;
+            if (++spins < 200) { RING_PAUSE(); }
+            else { std::this_thread::yield(); spins = 0; }
+        } while (Clock::now() < deadline);
+        return false;
     }
 
-    // ---- Add to include/ring/ring_mpmc.hpp (inside class RingMPMC<T>) ----
-
-    // Pointer-based enqueue_many (fallback that doesn't need <span>)
+    // -------- Batched enqueue (block reservation) --------
+    // Pointer overload (portable for VS2019)
     std::size_t enqueue_many(const T* data, std::size_t n) noexcept {
         if (n == 0) return 0;
-        // Clamp to capacity just like the span version
         const std::size_t want = (n > capacity_) ? capacity_ : n;
 
         std::uint64_t start = tail_.fetch_add(want, ACQ_REL);
@@ -194,64 +146,47 @@ public:
             for (;;) {
                 std::uint64_t seq = s.seq.load(ACQUIRE);
                 if (seq == expected) break;
-                if (++spins < 200) { /* optional: _mm_pause(); */ }
+                if (++spins < 200) { RING_PAUSE(); }
                 else { std::this_thread::yield(); spins = 0; }
             }
-            new (s.ptr()) T(data[i]);
+
+            construct_in_slot(s, data[i]);
             s.seq.store(idx + 1, RELEASE);
             ++done;
         }
         return done;
     }
 
-    // Pointer-based dequeue_many
-    // Non-reserving dequeue_many: attempt up to n items via try_dequeue.
-    // Avoids tail-of-run deadlock when no more items will be produced.
-    // Non-blocking, safe batched dequeue:
-    // - Peeks at head, counts only the *contiguous ready* items
-    // - CAS-claims exactly that many
-    // - Consumes them
+    // -------- Batched dequeue (non-reserving, claim only ready run) --------
     std::size_t dequeue_many(T* out, std::size_t n) noexcept {
         if (n == 0) return 0;
         n = (n > capacity_) ? capacity_ : n;
 
         for (;;) {
-            // Snapshot the current head
             std::uint64_t start = head_.load(RELAXED);
 
-            // Count how many *consecutive* items are actually ready
+            // Count contiguous ready items
             std::size_t ready = 0;
             while (ready < n) {
                 const std::uint64_t idx = start + ready;
                 Slot<T>& s = slot(idx);
-                const std::uint64_t expected = idx + 1;
-                if (s.seq.load(ACQUIRE) != expected) break;
+                if (s.seq.load(ACQUIRE) != (idx + 1)) break;
                 ++ready;
             }
+            if (ready == 0) return 0;
 
-            if (ready == 0) {
-                // Nothing ready right now
-                return 0;
-            }
-
-            // Try to claim [start, start+ready)
             if (head_.compare_exchange_weak(start, start + ready, ACQ_REL, RELAXED)) {
-                // We own these 'ready' slots now; consume them
                 for (std::size_t i = 0; i < ready; ++i) {
-                    const std::uint64_t idx = (start + i);
+                    const std::uint64_t idx = start + i;
                     Slot<T>& s = slot(idx);
-                    T* p = s.ptr();
-                    out[i] = std::move(*p);
-                    p->~T();
-                    s.seq.store(idx + capacity_, RELEASE); // free slot
+                    move_out_and_destroy(s, out[i]);
+                    s.seq.store(idx + capacity_, RELEASE);
                 }
                 return ready;
             }
-            // CAS lost a race—another consumer advanced head; retry
+            // lost race; retry
         }
     }
-
-
 
     std::size_t size() const noexcept {
         auto h = head_.load(RELAXED);
@@ -260,8 +195,30 @@ public:
     }
 
 private:
-    Slot<T>& slot(std::uint64_t idx) noexcept { return slots_[static_cast<std::size_t>(idx) & mask_]; }
+    template <class U>
+    static inline void construct_in_slot(Slot<T>& s, U&& value) noexcept {
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            *s.ptr() = static_cast<T>(std::forward<U>(value));
+        } else {
+            new (s.ptr()) T(std::forward<U>(value));
+        }
+    }
 
+    static inline void move_out_and_destroy(Slot<T>& s, T& out) noexcept {
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            out = *s.ptr();
+        } else {
+            T* p = s.ptr();
+            out = std::move(*p);
+            p->~T();
+        }
+    }
+
+    Slot<T>& slot(std::uint64_t idx) noexcept {
+        return slots_[static_cast<std::size_t>(idx) & mask_];
+    }
+
+private:
     const std::size_t capacity_;
     const std::size_t mask_;
     Slot<T>* slots_;

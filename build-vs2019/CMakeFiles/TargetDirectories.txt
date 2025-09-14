@@ -1,5 +1,6 @@
 C:/Applications/VSCode/CPUEmu/mlmpmc-ring/build-vs2019/CMakeFiles/ring_main.dir
 C:/Applications/VSCode/CPUEmu/mlmpmc-ring/build-vs2019/CMakeFiles/test_correctness.dir
+C:/Applications/VSCode/CPUEmu/mlmpmc-ring/build-vs2019/CMakeFiles/test_exactly_once.dir
 C:/Applications/VSCode/CPUEmu/mlmpmc-ring/build-vs2019/CMakeFiles/bench_throughput.dir
 C:/Applications/VSCode/CPUEmu/mlmpmc-ring/build-vs2019/CMakeFiles/cpu_demo.dir
 C:/Applications/VSCode/CPUEmu/mlmpmc-ring/build-vs2019/CMakeFiles/ALL_BUILD.dir

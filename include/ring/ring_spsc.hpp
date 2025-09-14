@@ -2,17 +2,17 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <span>
+#include <new>
 #include <type_traits>
 #include <utility>
-#include <new>
+#include <chrono>
+#include <thread>
 #include "ring.hpp"
 #include "utils.hpp"
 
 namespace ring {
 
 // Single-Producer / Single-Consumer ring with ticketed slots.
-// Fixed capacity (power-of-two recommended).
 template <class T>
 class RingSPSC {
 public:
@@ -22,17 +22,13 @@ public:
           slots_(static_cast<Slot<T>*>(::operator new[](capacity_ * sizeof(Slot<T>)))),
           head_(0), tail_(0)
     {
-        // Initialize slot tickets: seq = index
         for (std::size_t i = 0; i < capacity_; ++i) {
             new (&slots_[i]) Slot<T>();
             slots_[i].seq.store(static_cast<std::uint64_t>(i), RELAXED);
         }
     }
 
-    ~RingSPSC() {
-        // NOTE: Caller must ensure queue is drained or only trivially-destructible T is stored.
-        ::operator delete[](slots_);
-    }
+    ~RingSPSC() { ::operator delete[](slots_); }
 
     RingSPSC(const RingSPSC&) = delete;
     RingSPSC& operator=(const RingSPSC&) = delete;
@@ -40,58 +36,49 @@ public:
     std::size_t capacity() const noexcept { return capacity_; }
 
     bool try_enqueue(const T& v) noexcept {
-    const uint64_t t = tail_.load(RELAXED);
-    Slot<T>& s = slot(t);
-    // Producer expects seq == t
-    if (s.seq.load(ACQUIRE) != t) return false; // full
-    // Construct in-place
-    new (s.ptr()) T(v);
-    // Publish: payload must be visible before seq advances
-    s.seq.store(t + 1, RELEASE);
-    tail_.store(t + 1, RELAXED);
-    return true;
+        const std::uint64_t t = tail_.load(RELAXED);
+        Slot<T>& s = slot(t);
+        if (s.seq.load(ACQUIRE) != t) return false; // full
+        construct_in_slot(s, v);
+        s.seq.store(t + 1, RELEASE);
+        tail_.store(t + 1, RELAXED);
+        return true;
     }
 
     bool try_enqueue(T&& v) noexcept {
-        const uint64_t t = tail_.load(RELAXED);
+        const std::uint64_t t = tail_.load(RELAXED);
         Slot<T>& s = slot(t);
-        if (s.seq.load(ACQUIRE) != t) return false; // full
-        new (s.ptr()) T(std::move(v));
+        if (s.seq.load(ACQUIRE) != t) return false;
+        construct_in_slot(s, std::move(v));
         s.seq.store(t + 1, RELEASE);
         tail_.store(t + 1, RELAXED);
         return true;
     }
 
     bool try_dequeue(T& out) noexcept {
-        const uint64_t h = head_.load(RELAXED);
+        const std::uint64_t h = head_.load(RELAXED);
         Slot<T>& s = slot(h);
-        // Consumer expects seq == h + 1
         if (s.seq.load(ACQUIRE) != (h + 1)) return false; // empty
-        // Move out, destroy in-place object
-        T* p = s.ptr();
-        out = std::move(*p);
-        p->~T();
-        // Make slot available for the next wrap: set to h + capacity_
+        move_out_and_destroy(s, out);
         s.seq.store(h + capacity_, RELEASE);
         head_.store(h + 1, RELAXED);
         return true;
     }
 
-
-    // Batch enqueue: returns number actually enqueued (0..n)
-    std::size_t enqueue_many(std::span<const T> items) noexcept {
-        // TODO: Reserve a run of slots and write with fewer atomics
-        (void)items;
-        return 0; // stub
+    template <class Clock, class Dur>
+    bool enqueue_until(const T& v, const std::chrono::time_point<Clock, Dur>& deadline) noexcept {
+        do { if (try_enqueue(v)) return true; std::this_thread::yield(); }
+        while (Clock::now() < deadline);
+        return false;
     }
 
-    // Batch dequeue: fills 'out' with up to out.size() items; returns count
-    std::size_t dequeue_many(std::span<T> out) noexcept {
-        (void)out;
-        return 0; // stub
+    template <class Clock, class Dur>
+    bool dequeue_until(T& out, const std::chrono::time_point<Clock, Dur>& deadline) noexcept {
+        do { if (try_dequeue(out)) return true; std::this_thread::yield(); }
+        while (Clock::now() < deadline);
+        return false;
     }
 
-    // Approximate size (SPSC: safe snapshot)
     std::size_t size() const noexcept {
         auto h = head_.load(RELAXED);
         auto t = tail_.load(RELAXED);
@@ -99,13 +86,31 @@ public:
     }
 
 private:
+    template <class U>
+    static inline void construct_in_slot(Slot<T>& s, U&& value) noexcept {
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            *s.ptr() = static_cast<T>(std::forward<U>(value));
+        } else {
+            new (s.ptr()) T(std::forward<U>(value));
+        }
+    }
+    static inline void move_out_and_destroy(Slot<T>& s, T& out) noexcept {
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            out = *s.ptr();
+        } else {
+            T* p = s.ptr();
+            out = std::move(*p);
+            p->~T();
+        }
+    }
+
     Slot<T>& slot(std::uint64_t idx) noexcept { return slots_[static_cast<std::size_t>(idx) & mask_]; }
 
+private:
     const std::size_t capacity_;
     const std::size_t mask_;
     Slot<T>* slots_;
 
-    // Producer advances tail; Consumer advances head
     alignas(64) std::atomic<std::uint64_t> head_;
     CachePad _pad1_;
     alignas(64) std::atomic<std::uint64_t> tail_;

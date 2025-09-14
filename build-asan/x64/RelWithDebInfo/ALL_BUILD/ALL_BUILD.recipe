@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ProjectOutputs>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\x64\RelWithDebInfo\ZERO_CHECK</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\RelWithDebInfo\bench_throughput.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\RelWithDebInfo\cpu_demo.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\RelWithDebInfo\ring_main.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\RelWithDebInfo\test_correctness.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\RelWithDebInfo\test_exactly_once.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Applications\VSCode\CPUEmu\mlmpmc-ring\build-asan\x64\RelWithDebInfo\ALL_BUILD</FullPath>
+    </ProjectOutput>
+  </ProjectOutputs>
+  <ContentFiles />
+  <SatelliteDlls />
+  <NonRecipeFileRefs />
+</Project>
